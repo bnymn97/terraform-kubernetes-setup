@@ -21,7 +21,6 @@ Ziel war es, während meines Praktikums eine wiederverwendbare Infrastruktur-Vor
 - [Terraform](https://www.terraform.io/)
 - [Hetzner Cloud](https://www.hetzner.com/)
 - [Kubernetes](https://kubernetes.io/de/)
-- [MinIO](https://min.io/)
 - [Velero](https://velero.io/)
 - [Helm](https://helm.sh/)
 - [GitLab CI/CD](https://docs.gitlab.com/ee/ci/)
