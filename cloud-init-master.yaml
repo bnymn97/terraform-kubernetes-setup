@@ -1,0 +1,158 @@
+#cloud-config
+package_update: true
+packages:
+  - apt-transport-https
+  - ca-certificates
+  - curl
+  - gpg
+  - containerd
+
+write_files:
+  - path: /etc/modules-load.d/k8s.conf
+    content: |
+      overlay
+      br_netfilter
+
+  - path: /etc/sysctl.d/k8s.conf
+    content: |
+      net.bridge.bridge-nf-call-iptables  = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward                 = 1
+
+  - path: /root/velero-creds/credentials-velero
+    permissions: "0600"
+    content: |
+      [default]
+      aws_access_key_id=${velero_access_key}
+      aws_secret_access_key=${velero_secret_key}
+
+  - path: /root/install-velero.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      echo "[INFO] Starte Velero Setup: $(date)"
+      export KUBECONFIG=/root/.kube/config
+
+      until kubectl get nodes >/dev/null 2>&1; do
+        echo "[INFO] API noch nicht bereit, warte..."
+        sleep 10
+      done
+
+      /usr/local/bin/velero install \
+        --provider aws \
+        --plugins velero/velero-plugin-for-aws:v1.8.0 \
+        --bucket backup-cluster \
+        --backup-location-config region=eu-central-1,s3ForcePathStyle=true,s3Url=https://nbg1.your-objectstorage.com \
+        --secret-file /root/velero-creds/credentials-velero \
+        --use-node-agent \
+        --uploader-type=restic \
+        --wait
+
+  - path: /root/velero-schedule.yaml
+    permissions: "0644"
+    content: |
+      apiVersion: velero.io/v1
+      kind: Schedule
+      metadata:
+        name: friday-backup
+        namespace: velero
+      spec:
+        schedule: "0 22 * * 5"
+        template:
+          ttl: 720h0m0s
+          includedNamespaces:
+            - '*'
+          defaultVolumesToFsBackup: true
+
+  - path: /root/install-ingress.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      echo "[INFO] Starte Ingress Setup: $(date)" >> /var/log/install-ingress.log
+      export KUBECONFIG=/root/.kube/config
+
+      until kubectl get nodes >/dev/null 2>&1; do
+        echo "[INFO] Kubernetes API noch nicht bereit, warte..." >> /var/log/install-ingress.log
+        sleep 10
+      done
+
+      helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+      helm repo update
+
+      helm install ingress-nginx ingress-nginx/ingress-nginx \
+        --namespace ingress-nginx \
+        --create-namespace \
+        --set controller.service.type=NodePort \
+        --set controller.service.nodePorts.http=30080 \
+        --set controller.service.nodePorts.https=30443 \
+        --set controller.nodeSelector.role=ingress \
+        --set controller.kind=DaemonSet >> /var/log/install-ingress.log 2>&1
+
+      echo "[INFO] Ingress-Installation abgeschlossen: $(date)" >> /var/log/install-ingress.log
+
+  - path: /root/label-ingress-nodes.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      echo "[INFO] Starte Labeling der Worker-Nodes..." >> /var/log/label-ingress.log
+      export KUBECONFIG=/root/.kube/config
+      for i in $(seq 1 30); do
+        nodes=$(kubectl get nodes -o name | grep worker)
+        if [ -n "$nodes" ]; then
+          for node in $nodes; do
+            kubectl label $node role=ingress --overwrite
+            echo "[INFO] Gelabelt: $node" >> /var/log/label-ingress.log
+          done
+          break
+        fi
+        echo "[INFO] Warte auf Worker-Nodes..." >> /var/log/label-ingress.log
+        sleep 10
+      done
+
+runcmd:
+  - swapoff -a
+  - sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+  - modprobe overlay
+  - modprobe br_netfilter
+  - sysctl --system
+
+  - mkdir -p /etc/containerd
+  - containerd config default | tee /etc/containerd/config.toml
+  - sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+  - systemctl restart containerd
+  - systemctl enable containerd
+
+  - curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  - echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /" > /etc/apt/sources.list.d/kubernetes.list
+  - apt-get update
+  - apt-get install -y kubelet=1.29.6-1.1 kubeadm=1.29.6-1.1 kubectl=1.29.6-1.1
+  - apt-mark hold kubelet kubeadm kubectl
+
+  - crictl config runtime-endpoint unix:///var/run/containerd/containerd.sock
+
+  - kubeadm init --pod-network-cidr=192.168.0.0/16 --apiserver-advertise-address=10.0.0.2 --node-name k8s-master | tee /root/kubeadm-init.log
+  - mkdir -p /root/.kube
+  - cp /etc/kubernetes/admin.conf /root/.kube/config
+
+  - kubectl --kubeconfig=/root/.kube/config apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.5/manifests/calico.yaml
+
+  - kubeadm token create --print-join-command > /root/join.sh
+  - chmod +x /root/join.sh
+  - nohup python3 -m http.server 8080 --directory /root > /dev/null 2>&1 &
+
+  - curl -L https://github.com/vmware-tanzu/velero/releases/download/v1.15.2/velero-v1.15.2-linux-arm64.tar.gz -o velero.tar.gz
+  - tar -xzvf velero.tar.gz
+  - mv velero-v1.15.2-linux-arm64/velero /usr/local/bin/
+  - chmod +x /usr/local/bin/velero
+
+  - nohup bash /root/install-velero.sh > /root/velero-cloudinit.log 2>&1 &
+
+  - kubectl apply -f /root/velero-schedule.yaml --kubeconfig=/root/.kube/config
+
+  - nohup bash /root/label-ingress-nodes.sh > /dev/null 2>&1 &
+
+  - curl -sSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+  - helm repo update
+
+  - nohup bash /root/install-ingress.sh > /dev/null 2>&1 &
