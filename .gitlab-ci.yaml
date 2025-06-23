@@ -1,0 +1,36 @@
+stages:
+  - validate
+  - plan
+  - apply
+
+image: hashicorp/terraform:1.5.7
+
+variables:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+before_script:
+  - terraform init
+
+validate:
+  stage: validate
+  script:
+    - terraform validate
+
+plan:
+  stage: plan
+  script:
+    - terraform plan -out=tfplan
+  artifacts:
+    paths:
+      - tfplan
+    expire_in: 1 hour
+
+apply:
+  stage: apply
+  script:
+    - terraform apply -auto-approve tfplan
+  when: manual
+  allow_failure: false
+  dependencies:
+    - plan
